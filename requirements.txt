@@ -1,0 +1,5 @@
+# UTWORLDIA — Dépendances Python
+# Installer avec : pip3 install -r requirements.txt
+
+groq>=0.4.0
+python-dotenv>=1.0.0
