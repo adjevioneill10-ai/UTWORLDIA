@@ -276,12 +276,19 @@ class AIEngine:
     def _parse_raw(self, raw: str) -> dict:
         if not raw:
             raise ValueError("Réponse vide de l'IA")
+        # Extrait le JSON des balises markdown
         if "```json" in raw:
             raw = raw.split("```json")[1].split("```")[0].strip()
         elif "```" in raw:
             raw = raw.split("```")[1].split("```")[0].strip()
+        # Isole uniquement le bloc JSON { ... }
+        start = raw.find("{")
+        end   = raw.rfind("}") + 1
+        if start != -1 and end > start:
+            raw = raw[start:end]
+        # Supprime tous les caractères de contrôle invalides
         raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', ' ', raw)
-        raw = raw.replace('\r', ' ')
+        raw = raw.replace('\r', '')
         return json.loads(raw)
 
     def analyze(self, msg: EmailMessage) -> EmailMessage:
