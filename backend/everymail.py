@@ -332,6 +332,10 @@ URGENCE :
             )
             raw = resp.choices[0].message.content.strip()
 
+          # Vérifie que la réponse n'est pas vide
+            if not raw:
+             raise ValueError("Réponse vide de l'IA")
+
             # Nettoie les balises markdown si présentes
             if "```json" in raw:
                 raw = raw.split("```json")[1].split("```")[0].strip()
@@ -352,15 +356,31 @@ URGENCE :
 
             print(f"   📊 Urgence : {msg.urgency_score}/10 | Catégorie : {msg.category} | Formulaire : {msg.needs_form}")
 
-        except json.JSONDecodeError as e:
-            print(f"   ❌ JSON invalide : {e}")
-            msg.urgency_score      = 5
-            msg.category           = "Autre"
-            msg.needs_form         = False
-            msg.suggested_response = f"Bonjour,\n\nNous avons bien reçu votre message et nous vous répondrons très rapidement.\n\nÀ très vite,\nL'équipe {CONFIG['company_name']} ⚡"
-
-        except Exception as e:
-            print(f"   ❌ Erreur IA : {e}")
+        except (json.JSONDecodeError, ValueError) as e:
+         print(f"   ⚠️ Réponse IA invalide ({e}) — nouvelle tentative...")
+    time.sleep(3)
+    try:
+        resp2 = self.client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=800,
+            temperature=0.1,
+        )
+        raw2 = resp2.choices[0].message.content.strip()
+        if "```json" in raw2:
+            raw2 = raw2.split("```json")[1].split("```")[0].strip()
+        raw2 = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', raw2)
+        result = json.loads(raw2)
+        msg.urgency_score = int(result.get("urgency_score", 5))
+        msg.category = result.get("category", "Autre")
+        msg.needs_form = bool(result.get("needs_form", False))
+        msg.form_type = result.get("form_type") or ""
+        msg.suggested_response = result.get("response", "")
+    except Exception:
+        msg.urgency_score = 5
+        msg.category = "Autre"
+        msg.needs_form = False
+        msg.suggested_response = f"Bonjour,\n\nNous avons bien reçu votre message et nous vous répondrons très rapidement.\n\nCordialement,\nL'équipe {CONFIG['company_name']}"
 
         return msg
 
