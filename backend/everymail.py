@@ -5,7 +5,6 @@ envoie un formulaire si nécessaire ou répond directement.
 """
 
 import imaplib
-import smtplib
 import email
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -27,26 +26,23 @@ load_dotenv("../config/.env")
 # ─────────────────────────────────────────────────────
 
 CONFIG = {
-    # ── IA ──────────────────────────────────────────
     "groq_api_key": os.getenv("GROQ_API_KEY"),
+    "sendgrid_api_key": os.getenv("SENDGRID_API_KEY"),
 
-    # ── Email du client ──────────────────────────────
     "gmail": {
-        "email":       os.getenv("GMAIL_EMAIL"),
-        "password":    os.getenv("GMAIL_APP_PASSWORD"),
-        "imap_host":   "imap.gmail.com",
-        "smtp_host":   "smtp.gmail.com",
-        "smtp_port":   587,
+        "email":     os.getenv("GMAIL_EMAIL"),
+        "password":  os.getenv("GMAIL_APP_PASSWORD"),
+        "imap_host": "imap.gmail.com",
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 587,
     },
 
-    # ── Identité de l'entreprise ─────────────────────
     "company_name":    os.getenv("COMPANY_NAME", "UTWORLDIA"),
     "company_context": os.getenv("COMPANY_CONTEXT", "Agence d'automatisation IA pour PME."),
     "base_url":        os.getenv("BASE_URL", "http://localhost:8080"),
 
-    # ── Comportement ────────────────────────────────
     "urgency_threshold": 7,
-    "check_interval": 60,
+    "check_interval":    60,
 }
 
 # ─────────────────────────────────────────────────────
@@ -69,7 +65,7 @@ class EmailMessage:
     action:             str  = ""
 
 # ─────────────────────────────────────────────────────
-# CONNEXION EMAIL (IMAP / SMTP)
+# CONNEXION EMAIL (IMAP / SMTP / SENDGRID)
 # ─────────────────────────────────────────────────────
 
 class EmailConnector:
@@ -114,11 +110,9 @@ class EmailConnector:
         for keyword in self.IGNORE_SENDERS:
             if keyword in sender_lower:
                 return True
-
         for keyword in self.IGNORE_SUBJECTS:
             if keyword in subject_lower:
                 return True
-
         for header in self.IGNORE_HEADERS:
             if raw_msg.get(header.split(":")[0], "").lower():
                 return True
@@ -204,18 +198,35 @@ class EmailConnector:
         return body.strip()[:3000]
 
     def send(self, to: str, subject: str, body: str) -> bool:
+        subj = f"Re: {subject}" if not subject.startswith("Re:") else subject
         try:
-            msg = MIMEMultipart()
-            msg["From"]    = self.cfg["email"]
-            msg["To"]      = to
-            msg["Subject"] = f"Re: {subject}" if not subject.startswith("Re:") else subject
-            msg.attach(MIMEText(body, "plain", "utf-8"))
-
-            with smtplib.SMTP(self.cfg["smtp_host"], self.cfg["smtp_port"]) as s:
-                s.starttls()
-                s.login(self.cfg["email"], self.cfg["password"])
-                s.send_message(msg)
-            print(f"   ✅ Email envoyé à {to}")
+            sendgrid_key = CONFIG.get("sendgrid_api_key")
+            if sendgrid_key:
+                # ── Production : SendGrid ──────────────────────
+                from sendgrid import SendGridAPIClient
+                from sendgrid.helpers.mail import Mail
+                message = Mail(
+                    from_email=self.cfg["email"],
+                    to_emails=to,
+                    subject=subj,
+                    plain_text_content=body,
+                )
+                sg = SendGridAPIClient(sendgrid_key)
+                sg.send(message)
+                print(f"   ✅ Email envoyé via SendGrid à {to}")
+            else:
+                # ── Local : Gmail SMTP ─────────────────────────
+                import smtplib
+                msg = MIMEMultipart()
+                msg["From"]    = self.cfg["email"]
+                msg["To"]      = to
+                msg["Subject"] = subj
+                msg.attach(MIMEText(body, "plain", "utf-8"))
+                with smtplib.SMTP(self.cfg["smtp_host"], self.cfg["smtp_port"]) as s:
+                    s.starttls()
+                    s.login(self.cfg["email"], self.cfg["password"])
+                    s.send_message(msg)
+                print(f"   ✅ Email envoyé via Gmail à {to}")
             return True
         except Exception as e:
             print(f"   ❌ Erreur envoi : {e}")
@@ -261,8 +272,26 @@ class EmailConnector:
 
 class AIEngine:
 
+    # Modèles Groq gratuits — fallback automatique
+    MODELS = [
+        "llama-3.1-8b-instant",     # 500 000 tokens/jour
+        "gemma2-9b-it",             # 500 000 tokens/jour
+        "mixtral-8x7b-32768",       # 500 000 tokens/jour
+        "llama-3.3-70b-versatile",  # 100 000 tokens/jour
+    ]
+
     def __init__(self):
-        self.client = Groq(api_key=CONFIG["groq_api_key"])
+        self.client      = Groq(api_key=CONFIG["groq_api_key"])
+        self.model_index = 0
+
+    def _next_model(self) -> str:
+        self.model_index = (self.model_index + 1) % len(self.MODELS)
+        model = self.MODELS[self.model_index]
+        print(f"   🔄 Bascule vers : {model}")
+        return model
+
+    def _current_model(self) -> str:
+        return self.MODELS[self.model_index]
 
     def _default_response(self) -> dict:
         return {
@@ -270,7 +299,7 @@ class AIEngine:
             "category": "Autre",
             "needs_form": False,
             "form_type": "",
-            "suggested_response": f"Bonjour,\n\nNous avons bien reçu votre message et nous vous répondrons très rapidement.\n\nCordialement,\nL'équipe {CONFIG['company_name']}",
+            "response": f"Bonjour,\n\nNous avons bien reçu votre message et nous vous répondrons très rapidement.\n\nCordialement,\nL'équipe {CONFIG['company_name']}",
         }
 
     def _parse_raw(self, raw: str) -> dict:
@@ -280,8 +309,13 @@ class AIEngine:
             raw = raw.split("```json")[1].split("```")[0].strip()
         elif "```" in raw:
             raw = raw.split("```")[1].split("```")[0].strip()
+        # Isole uniquement le bloc JSON { ... }
+        start = raw.find("{")
+        end   = raw.rfind("}") + 1
+        if start != -1 and end > start:
+            raw = raw[start:end]
         raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', ' ', raw)
-        raw = raw.replace('\r', ' ')
+        raw = raw.replace('\r', '')
         return json.loads(raw)
 
     def analyze(self, msg: EmailMessage) -> EmailMessage:
@@ -341,41 +375,40 @@ URGENCE :
 
         result = None
 
-        # Tentative 1
-        try:
-            resp = self.client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1000,
-                temperature=0.3,
-            )
-            raw = resp.choices[0].message.content.strip()
-            result = self._parse_raw(raw)
-        except Exception as e:
-            print(f"   ⚠️ Tentative 1 échouée ({e}) — nouvelle tentative...")
-            time.sleep(3)
-
-        # Tentative 2
-        if result is None:
+        # Essaie jusqu'à 4 modèles différents
+        for attempt in range(len(self.MODELS)):
             try:
-                resp2 = self.client.chat.completions.create(
-                    model="llama-3.1-8b-instant",
+                model = self._current_model()
+                resp = self.client.chat.completions.create(
+                    model=model,
                     messages=[{"role": "user", "content": prompt}],
-                    max_tokens=800,
-                    temperature=0.1,
+                    max_tokens=1000,
+                    temperature=0.3,
                 )
-                raw2 = resp2.choices[0].message.content.strip()
-                result = self._parse_raw(raw2)
-            except Exception as e2:
-                print(f"   ❌ Tentative 2 échouée ({e2}) — réponse par défaut")
-                result = self._default_response()
+                raw = resp.choices[0].message.content.strip()
+                result = self._parse_raw(raw)
+                print(f"   ✅ Modèle : {model}")
+                break
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "rate_limit" in err.lower():
+                    print(f"   ⚠️ {self._current_model()} épuisé — bascule...")
+                    self._next_model()
+                    time.sleep(2)
+                else:
+                    print(f"   ⚠️ Erreur ({e}) — nouvelle tentative...")
+                    time.sleep(3)
+                    break
 
-        # Applique le résultat
+        if result is None:
+            print("   ❌ Tous les modèles épuisés — réponse par défaut")
+            result = self._default_response()
+
         msg.urgency_score      = int(result.get("urgency_score", 5))
         msg.category           = result.get("category", "Autre")
         msg.needs_form         = bool(result.get("needs_form", False))
         msg.form_type          = result.get("form_type") or ""
-        msg.suggested_response = result.get("response") or result.get("suggested_response", "")
+        msg.suggested_response = result.get("response", "")
 
         print(f"   📊 Urgence : {msg.urgency_score}/10 | Catégorie : {msg.category} | Formulaire : {msg.needs_form}")
 
@@ -393,14 +426,12 @@ class UTWORLDIA:
         self.stats     = {"total": 0, "sent": 0, "drafts": 0, "forms": 0, "errors": 0}
 
     def process(self, msg: EmailMessage) -> str:
-        # 1. Analyse IA
         msg = self.ai.analyze(msg)
 
         if not msg.suggested_response:
             self.stats["errors"] += 1
             return "error"
 
-        # 2. Si l'email est vague → envoie un formulaire
         if msg.needs_form and msg.form_type:
             try:
                 from form_server import create_form_session
@@ -411,8 +442,7 @@ class UTWORLDIA:
                     original_subject = msg.subject,
                 )
                 msg.suggested_response += (
-                    f"\n\n"
-                    f"Voici le lien vers votre formulaire :\n"
+                    f"\n\nVoici le lien vers votre formulaire :\n"
                     f"{form_link}\n\n"
                     f"Dès que vous l'aurez complété, vous recevrez une réponse personnalisée automatiquement."
                 )
@@ -426,7 +456,6 @@ class UTWORLDIA:
                 self.stats["sent"] += 1
                 msg.action = "auto_send"
 
-        # 3. Email complet → envoi auto ou brouillon selon urgence
         else:
             if msg.urgency_score >= CONFIG["urgency_threshold"]:
                 self.connector.send(msg.sender_email, msg.subject, msg.suggested_response)
