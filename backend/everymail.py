@@ -381,8 +381,8 @@ URGENCE :
         msg.category = "Autre"
         msg.needs_form = False
         msg.suggested_response = f"Bonjour,\n\nNous avons bien reçu votre message et nous vous répondrons très rapidement.\n\nCordialement,\nL'équipe {CONFIG['company_name']}"
-
-        return msg
+        
+    return msg
 
 # ─────────────────────────────────────────────────────
 # ORCHESTRATEUR PRINCIPAL
