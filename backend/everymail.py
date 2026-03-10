@@ -45,9 +45,7 @@ CONFIG = {
     "base_url":        os.getenv("BASE_URL", "http://localhost:8080"),
 
     # ── Comportement ────────────────────────────────
-    # Score d'urgence : >= seuil → envoi auto | < seuil → brouillon
     "urgency_threshold": 7,
-    # Vérification toutes les X secondes
     "check_interval": 60,
 }
 
@@ -57,18 +55,18 @@ CONFIG = {
 
 @dataclass
 class EmailMessage:
-    uid:               str
-    sender:            str
-    sender_email:      str
-    subject:           str
-    body:              str
-    date:              str
-    urgency_score:     int  = 0
-    category:          str  = ""
-    needs_form:        bool = False
-    form_type:         str  = ""
-    suggested_response:str  = ""
-    action:            str  = ""  # "auto_send" | "draft" | "form"
+    uid:                str
+    sender:             str
+    sender_email:       str
+    subject:            str
+    body:               str
+    date:               str
+    urgency_score:      int  = 0
+    category:           str  = ""
+    needs_form:         bool = False
+    form_type:          str  = ""
+    suggested_response: str  = ""
+    action:             str  = ""
 
 # ─────────────────────────────────────────────────────
 # CONNEXION EMAIL (IMAP / SMTP)
@@ -90,7 +88,6 @@ class EmailConnector:
             print(f"❌ Connexion Gmail échouée : {e}")
             return False
 
-    # ── Mots-clés qui indiquent un email automatique à ignorer ──
     IGNORE_SENDERS = [
         "noreply", "no-reply", "donotreply", "do-not-reply",
         "newsletter", "mailer", "notification", "notifications",
@@ -111,26 +108,21 @@ class EmailConnector:
     ]
 
     def _should_ignore(self, sender_email: str, subject: str, raw_msg) -> bool:
-        """Retourne True si l'email doit être ignoré"""
         sender_lower  = sender_email.lower()
         subject_lower = subject.lower()
 
-        # 1. Expéditeur no-reply ou automatique
         for keyword in self.IGNORE_SENDERS:
             if keyword in sender_lower:
                 return True
 
-        # 2. Sujet typique de newsletter / notif automatique
         for keyword in self.IGNORE_SUBJECTS:
             if keyword in subject_lower:
                 return True
 
-        # 3. Headers email automatique
         for header in self.IGNORE_HEADERS:
             if raw_msg.get(header.split(":")[0], "").lower():
                 return True
 
-        # 4. Ne jamais répondre à soi-même
         own_email = self.cfg["email"].lower()
         if sender_email.lower() == own_email:
             return True
@@ -150,8 +142,8 @@ class EmailConnector:
 
             uid_list = uids[0].split()[-max_emails:]
             print(f"📬 {len(uid_list)} email(s) non lu(s) — filtrage en cours...")
-            messages  = []
-            ignored   = 0
+            messages = []
+            ignored  = 0
 
             for uid in uid_list:
                 try:
@@ -159,24 +151,20 @@ class EmailConnector:
                     raw = data[0][1]
                     msg = email.message_from_bytes(raw)
 
-                    # Sujet
                     subj_raw = decode_header(msg["Subject"])[0]
                     subject  = subj_raw[0].decode(subj_raw[1] or "utf-8") if isinstance(subj_raw[0], bytes) else (subj_raw[0] or "(sans objet)")
 
-                    # Expéditeur
                     from_raw     = msg.get("From", "")
                     email_match  = re.findall(r'<(.+?)>', from_raw)
                     sender_email = email_match[0] if email_match else from_raw
                     sender_name  = from_raw.split("<")[0].strip().strip('"') if "<" in from_raw else from_raw
 
-                    # Filtre — ignore les emails automatiques
                     if self._should_ignore(sender_email, subject, msg):
                         print(f"   🚫 Ignoré (auto/newsletter) : '{subject}' de {sender_email}")
-                        self.mark_read(uid.decode())  # Marque comme lu sans répondre
+                        self.mark_read(uid.decode())
                         ignored += 1
                         continue
 
-                    # Corps
                     body = self._extract_body(msg)
 
                     messages.append(EmailMessage(
@@ -276,6 +264,26 @@ class AIEngine:
     def __init__(self):
         self.client = Groq(api_key=CONFIG["groq_api_key"])
 
+    def _default_response(self) -> dict:
+        return {
+            "urgency_score": 5,
+            "category": "Autre",
+            "needs_form": False,
+            "form_type": "",
+            "suggested_response": f"Bonjour,\n\nNous avons bien reçu votre message et nous vous répondrons très rapidement.\n\nCordialement,\nL'équipe {CONFIG['company_name']}",
+        }
+
+    def _parse_raw(self, raw: str) -> dict:
+        if not raw:
+            raise ValueError("Réponse vide de l'IA")
+        if "```json" in raw:
+            raw = raw.split("```json")[1].split("```")[0].strip()
+        elif "```" in raw:
+            raw = raw.split("```")[1].split("```")[0].strip()
+        raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', ' ', raw)
+        raw = raw.replace('\r', ' ')
+        return json.loads(raw)
+
     def analyze(self, msg: EmailMessage) -> EmailMessage:
         print(f"\n🤖 Analyse : '{msg.subject}' (de {msg.sender})")
 
@@ -308,21 +316,32 @@ RÈGLE needs_form = TRUE si l'email est vague et nécessite plus d'infos :
 
 RÈGLE needs_form = FALSE si l'email est clair et complet → on répond directement.
 
-STYLE DE RÉPONSE :
-- Français uniquement
-- Ton : moderne, dynamique, humain
-- Commence par "Bonjour [Prénom],"
-- Ligne vide entre chaque paragraphe
-- Max 3 paragraphes
-- Si needs_form = TRUE : dis que tu as besoin de quelques infos et qu'un formulaire rapide suit
-- Si needs_form = FALSE : réponds directement et complètement
-- Signature : "À très vite,\\nL'équipe {CONFIG['company_name']} ⚡"
+STYLE DE RÉPONSE — RÈGLES STRICTES :
+- Langue : français uniquement
+- Vouvoiement OBLIGATOIRE : toujours "vous", jamais "tu"
+- Commence TOUJOURS par "Bonjour [Prénom]," sur sa propre ligne
+- Une ligne vide entre chaque paragraphe
+- Structure en 3 paragraphes :
+  1. Accusé de réception professionnel et chaleureux
+  2. Explication claire de ce qu'on va faire
+  3. Invitation à agir
+- Si needs_form = TRUE : écrire dans le 2ème paragraphe :
+  "Afin de vous préparer une réponse précise et personnalisée, nous vous invitons à compléter notre formulaire rapide (2 minutes)."
+- Si needs_form = FALSE : répondre directement et complètement
+- Signature EXACTE en fin d'email :
+  "Cordialement,
+  L'équipe {CONFIG['company_name']}"
+- JAMAIS d'emoji dans la signature
+- JAMAIS mélanger "vous" et "tu"
 
 URGENCE :
 - 8-10 : Urgent (client bloqué, bug critique, plainte)
 - 5-7  : Normal (devis, RDV, question)
 - 1-4  : Basse priorité (info générale, spam probable)"""
 
+        result = None
+
+        # Tentative 1
         try:
             resp = self.client.chat.completions.create(
                 model="llama-3.1-8b-instant",
@@ -331,57 +350,35 @@ URGENCE :
                 temperature=0.3,
             )
             raw = resp.choices[0].message.content.strip()
+            result = self._parse_raw(raw)
+        except Exception as e:
+            print(f"   ⚠️ Tentative 1 échouée ({e}) — nouvelle tentative...")
+            time.sleep(3)
 
-          # Vérifie que la réponse n'est pas vide
-            if not raw:
-             raise ValueError("Réponse vide de l'IA")
+        # Tentative 2
+        if result is None:
+            try:
+                resp2 = self.client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=800,
+                    temperature=0.1,
+                )
+                raw2 = resp2.choices[0].message.content.strip()
+                result = self._parse_raw(raw2)
+            except Exception as e2:
+                print(f"   ❌ Tentative 2 échouée ({e2}) — réponse par défaut")
+                result = self._default_response()
 
-            # Nettoie les balises markdown si présentes
-            if "```json" in raw:
-                raw = raw.split("```json")[1].split("```")[0].strip()
-            elif "```" in raw:
-                raw = raw.split("```")[1].split("```")[0].strip()
+        # Applique le résultat
+        msg.urgency_score      = int(result.get("urgency_score", 5))
+        msg.category           = result.get("category", "Autre")
+        msg.needs_form         = bool(result.get("needs_form", False))
+        msg.form_type          = result.get("form_type") or ""
+        msg.suggested_response = result.get("response") or result.get("suggested_response", "")
 
-            # Supprime les caractères de contrôle invalides
-            raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x27]', ' ', raw)
-            raw = raw.replace('\n', ' ').replace('\r', ' ')
+        print(f"   📊 Urgence : {msg.urgency_score}/10 | Catégorie : {msg.category} | Formulaire : {msg.needs_form}")
 
-            result = json.loads(raw)
-
-            msg.urgency_score      = int(result.get("urgency_score", 5))
-            msg.category           = result.get("category", "Autre")
-            msg.needs_form         = bool(result.get("needs_form", False))
-            msg.form_type          = result.get("form_type") or ""
-            msg.suggested_response = result.get("response", "")
-
-            print(f"   📊 Urgence : {msg.urgency_score}/10 | Catégorie : {msg.category} | Formulaire : {msg.needs_form}")
-
-        except (json.JSONDecodeError, ValueError) as e:
-         print(f"   ⚠️ Réponse IA invalide ({e}) — nouvelle tentative...")
-    time.sleep(3)
-    try:
-        resp2 = self.client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=800,
-            temperature=0.1,
-        )
-        raw2 = resp2.choices[0].message.content.strip()
-        if "```json" in raw2:
-            raw2 = raw2.split("```json")[1].split("```")[0].strip()
-        raw2 = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', raw2)
-        result = json.loads(raw2)
-        msg.urgency_score = int(result.get("urgency_score", 5))
-        msg.category = result.get("category", "Autre")
-        msg.needs_form = bool(result.get("needs_form", False))
-        msg.form_type = result.get("form_type") or ""
-        msg.suggested_response = result.get("response", "")
-    except Exception:
-        msg.urgency_score = 5
-        msg.category = "Autre"
-        msg.needs_form = False
-        msg.suggested_response = f"Bonjour,\n\nNous avons bien reçu votre message et nous vous répondrons très rapidement.\n\nCordialement,\nL'équipe {CONFIG['company_name']}"
-        
         return msg
 
 # ─────────────────────────────────────────────────────
@@ -408,15 +405,16 @@ class UTWORLDIA:
             try:
                 from form_server import create_form_session
                 form_link = create_form_session(
-                    form_type      = msg.form_type,
-                    client_email   = msg.sender_email,
-                    client_name    = msg.sender,
+                    form_type        = msg.form_type,
+                    client_email     = msg.sender_email,
+                    client_name      = msg.sender,
                     original_subject = msg.subject,
                 )
                 msg.suggested_response += (
-                    f"\n\n👉 Pour que je puisse te répondre précisément, "
-                    f"remplis ce formulaire rapide (2 min) :\n{form_link}\n\n"
-                    f"Dès que c'est fait, tu reçois une réponse personnalisée automatiquement."
+                    f"\n\n"
+                    f"Voici le lien vers votre formulaire :\n"
+                    f"{form_link}\n\n"
+                    f"Dès que vous l'aurez complété, vous recevrez une réponse personnalisée automatiquement."
                 )
                 print(f"   📋 Formulaire : {form_link}")
                 self.connector.send(msg.sender_email, msg.subject, msg.suggested_response)
@@ -424,6 +422,8 @@ class UTWORLDIA:
                 msg.action = "form"
             except ImportError:
                 print("   ⚠️ form_server non disponible — réponse directe")
+                self.connector.send(msg.sender_email, msg.subject, msg.suggested_response)
+                self.stats["sent"] += 1
                 msg.action = "auto_send"
 
         # 3. Email complet → envoi auto ou brouillon selon urgence
@@ -457,7 +457,6 @@ class UTWORLDIA:
               f"❌ Erreurs : {self.stats['errors']}")
 
     def run_forever(self):
-        # Lance le serveur de formulaires en arrière-plan
         try:
             from form_server import start_server
             t = threading.Thread(target=start_server, args=(8080,), daemon=True)
