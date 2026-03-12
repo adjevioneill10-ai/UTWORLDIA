@@ -5,7 +5,6 @@ envoie un formulaire si nécessaire ou répond directement.
 """
 
 import imaplib
-import smtplib
 import email
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -18,35 +17,31 @@ import re
 import time
 import threading
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 load_dotenv("../config/.env")
 
 # ─────────────────────────────────────────────────────
-# CONFIGURATION — Modifie ici pour chaque client
+# CONFIGURATION
 # ─────────────────────────────────────────────────────
 
 CONFIG = {
-    # ── IA ──────────────────────────────────────────
-    "groq_api_key": os.getenv("GROQ_API_KEY"),
+    "groq_api_key":     os.getenv("GROQ_API_KEY"),
+    "sendgrid_api_key": os.getenv("SENDGRID_API_KEY"),
 
-    # ── Email du client ──────────────────────────────
     "gmail": {
-        "email":       os.getenv("GMAIL_EMAIL"),
-        "password":    os.getenv("GMAIL_APP_PASSWORD"),
-        "imap_host":   "imap.gmail.com",
-        "smtp_host":   "smtp.gmail.com",
-        "smtp_port":   587,
+        "email":     os.getenv("GMAIL_EMAIL"),
+        "password":  os.getenv("GMAIL_APP_PASSWORD"),
+        "imap_host": "imap.gmail.com",
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 587,
     },
 
-    # ── Identité de l'entreprise ─────────────────────
-    "company_name":    os.getenv("COMPANY_NAME", "UTWORLDIA"),
-    "company_context": os.getenv("COMPANY_CONTEXT", "Agence d'automatisation IA pour PME."),
-    "base_url":        os.getenv("BASE_URL", "http://localhost:8080"),
-
-    # ── Comportement ────────────────────────────────
+    "company_name":      os.getenv("COMPANY_NAME", "UTWORLDIA"),
+    "company_context":   os.getenv("COMPANY_CONTEXT", "Agence d'automatisation IA pour PME."),
+    "base_url":          os.getenv("BASE_URL", "http://localhost:8080"),
     "urgency_threshold": 7,
-    "check_interval": 60,
+    "check_interval":    60,
 }
 
 # ─────────────────────────────────────────────────────
@@ -69,14 +64,82 @@ class EmailMessage:
     action:             str  = ""
 
 # ─────────────────────────────────────────────────────
-# CONNEXION EMAIL (IMAP / SMTP)
+# UTILITAIRES
+# ─────────────────────────────────────────────────────
+
+def clean_text(text: str) -> str:
+    """Supprime tous les caractères qui cassent le JSON ou l'IMAP."""
+    if not text:
+        return ""
+    # Supprime les caractères de contrôle sauf \n et \t
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', text)
+    # Normalise les sauts de ligne
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    # Limite la longueur
+    return text.strip()
+
+def clean_for_prompt(text: str) -> str:
+    """Nettoie le texte pour l'injection dans un prompt IA."""
+    text = clean_text(text)
+    # Remplace les guillemets et apostrophes qui cassent le JSON
+    text = text.replace('\\', ' ').replace('"', ' ').replace("'", ' ')
+    return text[:2000]
+
+def decode_mime_header(raw: str) -> str:
+    """Décode un header MIME encodé (ex: =?utf-8?...)."""
+    if not raw:
+        return ""
+    try:
+        parts = decode_header(raw)
+        result = ""
+        for part, charset in parts:
+            if isinstance(part, bytes):
+                result += part.decode(charset or "utf-8", errors="replace")
+            else:
+                result += str(part)
+        return clean_text(result)
+    except Exception:
+        return clean_text(str(raw))
+
+# ─────────────────────────────────────────────────────
+# CONNEXION EMAIL
 # ─────────────────────────────────────────────────────
 
 class EmailConnector:
 
+    IGNORE_SENDERS = [
+        "noreply", "no-reply", "donotreply", "do-not-reply",
+        "newsletter", "mailer", "notification", "notifications",
+        "automated", "automatique", "bounce", "postmaster",
+        "support@github", "info@linkedin", "member@linkedin",
+        "daemon", "alert", "system", "wordpress", "woocommerce",
+    ]
+
+    IGNORE_SUBJECTS = [
+        "unsubscribe", "se désabonner", "newsletter",
+        "promotion", "offre spéciale", "soldes",
+        "nouvel horaire", "nouveau programme", "planning",
+        "votre facture", "your invoice", "reçu de paiement",
+        "verify your", "confirm your", "activate your",
+        "password reset", "réinitialisation",
+    ]
+
     def __init__(self):
         self.cfg  = CONFIG["gmail"]
         self.imap = None
+
+    def _reconnect(self) -> bool:
+        """Ferme et réouvre la connexion IMAP proprement."""
+        try:
+            if self.imap:
+                try:
+                    self.imap.logout()
+                except Exception:
+                    pass
+            self.imap = None
+        except Exception:
+            pass
+        return self.connect()
 
     def connect(self) -> bool:
         try:
@@ -86,53 +149,46 @@ class EmailConnector:
             return True
         except Exception as e:
             print(f"❌ Connexion Gmail échouée : {e}")
+            self.imap = None
             return False
 
-    IGNORE_SENDERS = [
-        "noreply", "no-reply", "donotreply", "do-not-reply",
-        "newsletter", "mailer", "notification", "notifications",
-        "automated", "automatique", "bounce", "postmaster",
-        "support@github", "info@linkedin", "member@linkedin",
-    ]
-
-    IGNORE_SUBJECTS = [
-        "unsubscribe", "se désabonner", "newsletter",
-        "promotion", "offre spéciale", "soldes",
-        "nouvel horaire", "nouveau programme", "planning",
-        "votre facture", "your invoice", "reçu de paiement",
-    ]
-
-    IGNORE_HEADERS = [
-        "list-unsubscribe", "x-mailer", "x-newsletter",
-        "precedence: bulk", "precedence: list",
-    ]
+    def _ping(self) -> bool:
+        """Vérifie si la connexion est vivante, reconnecte si nécessaire."""
+        try:
+            self.imap.noop()
+            return True
+        except Exception:
+            print("🔄 Reconnexion IMAP...")
+            return self._reconnect()
 
     def _should_ignore(self, sender_email: str, subject: str, raw_msg) -> bool:
-        sender_lower  = sender_email.lower()
-        subject_lower = subject.lower()
+        s = sender_email.lower()
+        sub = subject.lower()
 
-        for keyword in self.IGNORE_SENDERS:
-            if keyword in sender_lower:
+        for kw in self.IGNORE_SENDERS:
+            if kw in s:
+                return True
+        for kw in self.IGNORE_SUBJECTS:
+            if kw in sub:
                 return True
 
-        for keyword in self.IGNORE_SUBJECTS:
-            if keyword in subject_lower:
-                return True
+        # Headers typiques des newsletters
+        if raw_msg.get("List-Unsubscribe"):
+            return True
+        if raw_msg.get("Precedence", "").lower() in ("bulk", "list", "junk"):
+            return True
+        if raw_msg.get("X-Mailer") or raw_msg.get("X-Newsletter"):
+            return True
 
-        for header in self.IGNORE_HEADERS:
-            if raw_msg.get(header.split(":")[0], "").lower():
-                return True
-
-        own_email = self.cfg["email"].lower()
-        if sender_email.lower() == own_email:
+        # Ne jamais se répondre à soi-même
+        if sender_email.lower() == self.cfg["email"].lower():
             return True
 
         return False
 
-    def fetch_unread(self, max_emails: int = 20) -> list[EmailMessage]:
-        if not self.imap:
-            if not self.connect():
-                return []
+    def fetch_unread(self, max_emails: int = 10) -> list[EmailMessage]:
+        if not self._ping():
+            return []
         try:
             self.imap.select("INBOX")
             _, uids = self.imap.search(None, "UNSEEN")
@@ -148,19 +204,19 @@ class EmailConnector:
             for uid in uid_list:
                 try:
                     _, data = self.imap.fetch(uid, "(RFC822)")
+                    if not data or not data[0]:
+                        continue
                     raw = data[0][1]
                     msg = email.message_from_bytes(raw)
 
-                    subj_raw = decode_header(msg["Subject"])[0]
-                    subject  = subj_raw[0].decode(subj_raw[1] or "utf-8") if isinstance(subj_raw[0], bytes) else (subj_raw[0] or "(sans objet)")
-
+                    subject      = decode_mime_header(msg.get("Subject", "(sans objet)"))
                     from_raw     = msg.get("From", "")
                     email_match  = re.findall(r'<(.+?)>', from_raw)
-                    sender_email = email_match[0] if email_match else from_raw
-                    sender_name  = from_raw.split("<")[0].strip().strip('"') if "<" in from_raw else from_raw
+                    sender_email = email_match[0].strip() if email_match else from_raw.strip()
+                    sender_name  = decode_mime_header(from_raw.split("<")[0].strip().strip('"')) if "<" in from_raw else decode_mime_header(from_raw)
 
                     if self._should_ignore(sender_email, subject, msg):
-                        print(f"   🚫 Ignoré (auto/newsletter) : '{subject}' de {sender_email}")
+                        print(f"   🚫 Ignoré : '{subject}' de {sender_email}")
                         self.mark_read(uid.decode())
                         ignored += 1
                         continue
@@ -183,40 +239,73 @@ class EmailConnector:
 
         except Exception as e:
             print(f"❌ Erreur fetch : {e}")
+            self.imap = None  # Force reconnexion au prochain cycle
             return []
 
     def _extract_body(self, msg) -> str:
         body = ""
         if msg.is_multipart():
             for part in msg.walk():
-                if part.get_content_type() == "text/plain":
+                ct = part.get_content_type()
+                cd = str(part.get("Content-Disposition", ""))
+                if ct == "text/plain" and "attachment" not in cd:
                     try:
-                        body = part.get_payload(decode=True).decode("utf-8", errors="replace")
+                        charset = part.get_content_charset() or "utf-8"
+                        body = part.get_payload(decode=True).decode(charset, errors="replace")
                         break
-                    except:
+                    except Exception:
                         pass
         else:
             try:
-                body = msg.get_payload(decode=True).decode("utf-8", errors="replace")
-            except:
+                charset = msg.get_content_charset() or "utf-8"
+                body = msg.get_payload(decode=True).decode(charset, errors="replace")
+            except Exception:
                 body = str(msg.get_payload())
-        body = re.sub(r'<[^>]+>', '', body)
-        return body.strip()[:3000]
+
+        # Supprime le HTML résiduel
+        body = re.sub(r'<[^>]+>', ' ', body)
+        # Supprime les lignes de citation email (> texte)
+        body = re.sub(r'^>.*$', '', body, flags=re.MULTILINE)
+        # Nettoie les espaces multiples
+        body = re.sub(r'\n{3,}', '\n\n', body)
+        return clean_text(body)[:3000]
 
     def send(self, to: str, subject: str, body: str) -> bool:
+        subj = f"Re: {subject}" if not subject.lower().startswith("re:") else subject
         try:
-            msg = MIMEMultipart()
-            msg["From"]    = self.cfg["email"]
-            msg["To"]      = to
-            msg["Subject"] = f"Re: {subject}" if not subject.startswith("Re:") else subject
-            msg.attach(MIMEText(body, "plain", "utf-8"))
-
-            with smtplib.SMTP(self.cfg["smtp_host"], self.cfg["smtp_port"]) as s:
-                s.starttls()
-                s.login(self.cfg["email"], self.cfg["password"])
-                s.send_message(msg)
-            print(f"   ✅ Email envoyé à {to}")
-            return True
+            sendgrid_key = CONFIG.get("sendgrid_api_key")
+            if sendgrid_key:
+                from sendgrid import SendGridAPIClient
+                from sendgrid.helpers.mail import Mail
+                message = Mail(
+                    from_email=self.cfg["email"],
+                    to_emails=to,
+                    subject=subj,
+                    plain_text_content=body,
+                )
+                sg = SendGridAPIClient(sendgrid_key)
+                response = sg.send(message)
+                if response.status_code in (200, 202):
+                    print(f"   ✅ Email envoyé via SendGrid à {to}")
+                    return True
+                else:
+                    print(f"   ❌ SendGrid status : {response.status_code}")
+                    return False
+            else:
+                import smtplib
+                msg = MIMEMultipart()
+                msg["From"]    = self.cfg["email"]
+                msg["To"]      = to
+                msg["Subject"] = subj
+                msg.attach(MIMEText(body, "plain", "utf-8"))
+                with smtplib.SMTP(self.cfg["smtp_host"], self.cfg["smtp_port"]) as s:
+                    s.ehlo()
+                    s.starttls()
+                    s.ehlo()
+                    s.login(self.cfg["email"], self.cfg["password"])
+                    s.send_message(msg)
+                print(f"   ✅ Email envoyé via Gmail à {to}")
+                return True
         except Exception as e:
             print(f"   ❌ Erreur envoi : {e}")
             return False
@@ -226,11 +315,11 @@ class EmailConnector:
             msg = MIMEMultipart()
             msg["From"]    = self.cfg["email"]
             msg["To"]      = to
-            msg["Subject"] = f"Re: {subject}"
+            msg["Subject"] = f"Re: {subject}" if not subject.lower().startswith("re:") else subject
             msg.attach(MIMEText(body, "plain", "utf-8"))
 
-            if not self.imap:
-                self.connect()
+            if not self._ping():
+                return False
             self.imap.append(
                 "[Gmail]/Drafts", "\\Draft",
                 imaplib.Time2Internaldate(time.time()),
@@ -245,14 +334,14 @@ class EmailConnector:
     def mark_read(self, uid: str):
         try:
             self.imap.store(uid, "+FLAGS", "\\Seen")
-        except:
+        except Exception:
             pass
 
     def disconnect(self):
         try:
             if self.imap:
                 self.imap.logout()
-        except:
+        except Exception:
             pass
 
 # ─────────────────────────────────────────────────────
@@ -261,121 +350,153 @@ class EmailConnector:
 
 class AIEngine:
 
+    MODELS = [
+        "llama-3.1-8b-instant",     # 500 000 tokens/jour
+        "llama-3.3-70b-versatile",  # 100 000 tokens/jour
+    ]
+
     def __init__(self):
-        self.client = Groq(api_key=CONFIG["groq_api_key"])
+        self.client      = Groq(api_key=CONFIG["groq_api_key"])
+        self.model_index = 0
+
+    def _current_model(self) -> str:
+        return self.MODELS[self.model_index]
+
+    def _next_model(self) -> str:
+        self.model_index = (self.model_index + 1) % len(self.MODELS)
+        model = self.MODELS[self.model_index]
+        print(f"   🔄 Bascule vers : {model}")
+        return model
 
     def _default_response(self) -> dict:
         return {
             "urgency_score": 5,
-            "category": "Autre",
-            "needs_form": False,
-            "form_type": "",
-            "suggested_response": f"Bonjour,\n\nNous avons bien reçu votre message et nous vous répondrons très rapidement.\n\nCordialement,\nL'équipe {CONFIG['company_name']}",
+            "category":      "Autre",
+            "needs_form":    False,
+            "form_type":     "",
+            "response":      (
+                f"Bonjour,\n\n"
+                f"Nous avons bien reçu votre message et nous vous répondrons très rapidement.\n\n"
+                f"Cordialement,\nL'équipe {CONFIG['company_name']}"
+            ),
         }
 
     def _parse_raw(self, raw: str) -> dict:
         if not raw:
-            raise ValueError("Réponse vide de l'IA")
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw:
-            raw = raw.split("```")[1].split("```")[0].strip()
-        raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', ' ', raw)
-        raw = raw.replace('\r', ' ')
-        return json.loads(raw)
+            raise ValueError("Reponse vide")
+
+        lines = raw.strip().splitlines()
+        result = {}
+
+        # Parse le format ligne par ligne
+        response_lines = []
+        in_response = False
+
+        for line in lines:
+            line = line.strip()
+            if line.startswith("SCORE:"):
+                try:
+                    result["urgency_score"] = int(re.search(r"\d+", line).group())
+                except:
+                    result["urgency_score"] = 5
+            elif line.startswith("CATEGORIE:"):
+                result["category"] = line.split(":", 1)[1].strip()
+            elif line.startswith("FORMULAIRE:"):
+                val = line.split(":", 1)[1].strip().lower()
+                result["needs_form"] = val in ("oui", "true", "yes")
+            elif line.startswith("TYPE:"):
+                val = line.split(":", 1)[1].strip().lower()
+                result["form_type"] = "" if val in ("aucun", "null", "none") else val
+            elif line.startswith("REPONSE:"):
+                in_response = True
+                response_lines.append(line.split(":", 1)[1].strip())
+            elif in_response:
+                response_lines.append(line)
+
+        result["response"] = "\n".join(response_lines).strip()
+
+        if not result.get("response"):
+            raise ValueError("Reponse email vide")
+
+        return result
 
     def analyze(self, msg: EmailMessage) -> EmailMessage:
         print(f"\n🤖 Analyse : '{msg.subject}' (de {msg.sender})")
 
-        prompt = f"""Tu es l'assistant email officiel de {CONFIG['company_name']}.
+        # Nettoie tout le contenu avant injection dans le prompt
+        subject = clean_for_prompt(msg.subject)
+        body    = clean_for_prompt(msg.body)
+        sender  = clean_for_prompt(msg.sender)
+        company = clean_for_prompt(CONFIG['company_name'])
+        context = clean_for_prompt(CONFIG['company_context'])
 
-CONTEXTE DE L'ENTREPRISE :
-{CONFIG['company_context']}
-
-EMAIL REÇU :
-De      : {msg.sender} <{msg.sender_email}>
-Sujet   : {msg.subject}
-Contenu : {msg.body}
-
-INSTRUCTIONS :
-Réponds UNIQUEMENT en JSON avec ce format exact :
-{{
-  "urgency_score": <entier 1-10>,
-  "category": "<Devis|RDV|SAV|Information|Spam|Autre>",
-  "needs_form": <true ou false>,
-  "form_type": "<devis|rdv|sav|info|null>",
-  "reasoning": "<explication en 1 phrase>",
-  "response": "<réponse email complète>"
-}}
-
-RÈGLE needs_form = TRUE si l'email est vague et nécessite plus d'infos :
-- Demande de devis sans préciser le service ou budget → form_type = "devis"
-- Demande de RDV sans date/heure/objet → form_type = "rdv"
-- Problème SAV sans description précise → form_type = "sav"
-- Question générale trop vague → form_type = "info"
-
-RÈGLE needs_form = FALSE si l'email est clair et complet → on répond directement.
-
-STYLE DE RÉPONSE — RÈGLES STRICTES :
-- Langue : français uniquement
-- Vouvoiement OBLIGATOIRE : toujours "vous", jamais "tu"
-- Commence TOUJOURS par "Bonjour [Prénom]," sur sa propre ligne
-- Une ligne vide entre chaque paragraphe
-- Structure en 3 paragraphes :
-  1. Accusé de réception professionnel et chaleureux
-  2. Explication claire de ce qu'on va faire
-  3. Invitation à agir
-- Si needs_form = TRUE : écrire dans le 2ème paragraphe :
-  "Afin de vous préparer une réponse précise et personnalisée, nous vous invitons à compléter notre formulaire rapide (2 minutes)."
-- Si needs_form = FALSE : répondre directement et complètement
-- Signature EXACTE en fin d'email :
-  "Cordialement,
-  L'équipe {CONFIG['company_name']}"
-- JAMAIS d'emoji dans la signature
-- JAMAIS mélanger "vous" et "tu"
-
-URGENCE :
-- 8-10 : Urgent (client bloqué, bug critique, plainte)
-- 5-7  : Normal (devis, RDV, question)
-- 1-4  : Basse priorité (info générale, spam probable)"""
+        prompt = (
+            f"Tu es le gestionnaire email professionnel de {company}.\n"
+            f"Description de l entreprise : {context}\n\n"
+            f"=== EMAIL RECU ===\n"
+            f"Expediteur : {sender}\n"
+            f"Sujet : {subject}\n"
+            f"Message : {body}\n"
+            f"=================\n\n"
+            f"ETAPE 1 - Analyse :\n"
+            f"Lis attentivement le message. Identifie ce que le client veut vraiment.\n\n"
+            f"ETAPE 2 - Reponds avec exactement ce format, une valeur par ligne :\n\n"
+            f"SCORE: [chiffre de 1 a 10 selon urgence]\n"
+            f"CATEGORIE: [exactement un parmi : Devis, RDV, SAV, Information, Autre]\n"
+            f"FORMULAIRE: [oui si le message est trop vague pour repondre precisement, sinon non]\n"
+            f"TYPE: [si FORMULAIRE oui : devis ou rdv ou sav ou info. Sinon : aucun]\n"
+            f"REPONSE: [email complet professionnel en francais]\n\n"
+            f"=== REGLES STRICTES POUR LA REPONSE EMAIL ===\n"
+            f"- Commence TOUJOURS par : Bonjour {sender},\n"
+            f"- Vouvoiement OBLIGATOIRE (vous, votre, vos) — jamais tu\n"
+            f"- Ton professionnel et chaleureux\n"
+            f"- Paragraphe 1 : accuse reception du message en reformulant la demande\n"
+            f"- Paragraphe 2 : explique ce que tu vas faire\n"
+            f"  Si FORMULAIRE oui : ecris exactement cette phrase dans ce paragraphe :\n"
+            f"  Afin de vous preparer une reponse precise et personnalisee, nous vous invitons a completer notre formulaire rapide.\n"
+            f"  Si FORMULAIRE non : reponds directement et completement a la demande\n"
+            f"- Paragraphe 3 : invitation a agir ou question de suivi si necessaire\n"
+            f"- Termine TOUJOURS par :\n"
+            f"  Cordialement,\n"
+            f"  L equipe {company}\n"
+            f"- INTERDIT : emojis, abreviations, fautes d orthographe, melanger vous et tu\n"
+            f"- INTERDIT : inventer des informations que le client n a pas fournies"
+        )
 
         result = None
 
-        # Tentative 1
-        try:
-            resp = self.client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1000,
-                temperature=0.3,
-            )
-            raw = resp.choices[0].message.content.strip()
-            result = self._parse_raw(raw)
-        except Exception as e:
-            print(f"   ⚠️ Tentative 1 échouée ({e}) — nouvelle tentative...")
-            time.sleep(3)
-
-        # Tentative 2
-        if result is None:
+        for attempt in range(len(self.MODELS)):
             try:
-                resp2 = self.client.chat.completions.create(
-                    model="llama-3.1-8b-instant",
+                model = self._current_model()
+                resp  = self.client.chat.completions.create(
+                    model=model,
                     messages=[{"role": "user", "content": prompt}],
-                    max_tokens=800,
-                    temperature=0.1,
+                    max_tokens=1000,
+                    temperature=0.2,
                 )
-                raw2 = resp2.choices[0].message.content.strip()
-                result = self._parse_raw(raw2)
-            except Exception as e2:
-                print(f"   ❌ Tentative 2 échouée ({e2}) — réponse par défaut")
-                result = self._default_response()
+                raw    = resp.choices[0].message.content.strip()
+                result = self._parse_raw(raw)
+                print(f"   ✅ Modèle : {model}")
+                break
+            except Exception as e:
+                err = str(e)
+                if "429" in err or "rate_limit" in err.lower():
+                    print(f"   ⚠️ {self._current_model()} épuisé — bascule...")
+                    self._next_model()
+                    time.sleep(2)
+                else:
+                    print(f"   ⚠️ Erreur ({e}) — retry...")
+                    time.sleep(3)
 
-        # Applique le résultat
+        if result is None:
+            print("   ❌ Tous les modèles épuisés — réponse par défaut")
+            result = self._default_response()
+
         msg.urgency_score      = int(result.get("urgency_score", 5))
         msg.category           = result.get("category", "Autre")
         msg.needs_form         = bool(result.get("needs_form", False))
         msg.form_type          = result.get("form_type") or ""
-        msg.suggested_response = result.get("response") or result.get("suggested_response", "")
+        msg.suggested_response = result.get("response", "")
 
         print(f"   📊 Urgence : {msg.urgency_score}/10 | Catégorie : {msg.category} | Formulaire : {msg.needs_form}")
 
@@ -393,14 +514,13 @@ class UTWORLDIA:
         self.stats     = {"total": 0, "sent": 0, "drafts": 0, "forms": 0, "errors": 0}
 
     def process(self, msg: EmailMessage) -> str:
-        # 1. Analyse IA
         msg = self.ai.analyze(msg)
 
         if not msg.suggested_response:
             self.stats["errors"] += 1
+            self.connector.mark_read(msg.uid)
             return "error"
 
-        # 2. Si l'email est vague → envoie un formulaire
         if msg.needs_form and msg.form_type:
             try:
                 from form_server import create_form_session
@@ -411,22 +531,19 @@ class UTWORLDIA:
                     original_subject = msg.subject,
                 )
                 msg.suggested_response += (
-                    f"\n\n"
-                    f"Voici le lien vers votre formulaire :\n"
+                    f"\n\nVoici le lien vers votre formulaire :\n"
                     f"{form_link}\n\n"
                     f"Dès que vous l'aurez complété, vous recevrez une réponse personnalisée automatiquement."
                 )
                 print(f"   📋 Formulaire : {form_link}")
-                self.connector.send(msg.sender_email, msg.subject, msg.suggested_response)
-                self.stats["forms"] += 1
-                msg.action = "form"
             except ImportError:
                 print("   ⚠️ form_server non disponible — réponse directe")
-                self.connector.send(msg.sender_email, msg.subject, msg.suggested_response)
-                self.stats["sent"] += 1
-                msg.action = "auto_send"
+                msg.needs_form = False
 
-        # 3. Email complet → envoi auto ou brouillon selon urgence
+            self.connector.send(msg.sender_email, msg.subject, msg.suggested_response)
+            self.stats["forms" if msg.needs_form else "sent"] += 1
+            msg.action = "form" if msg.needs_form else "auto_send"
+
         else:
             if msg.urgency_score >= CONFIG["urgency_threshold"]:
                 self.connector.send(msg.sender_email, msg.subject, msg.suggested_response)
