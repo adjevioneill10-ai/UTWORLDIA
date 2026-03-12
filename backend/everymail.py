@@ -124,6 +124,10 @@ class EmailConnector:
         return False
 
     def fetch_unread(self, max_emails: int = 20) -> list[EmailMessage]:
+        try:
+            self.imap.noop()
+        except:
+            self.imap = None
         if not self.imap:
             if not self.connect():
                 return []
