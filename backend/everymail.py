@@ -383,31 +383,42 @@ class AIEngine:
 
     def _parse_raw(self, raw: str) -> dict:
         if not raw:
-            raise ValueError("Réponse vide de l'IA")
+            raise ValueError("Reponse vide")
 
-        # Extrait le bloc JSON des balises markdown
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw:
-            raw = raw.split("```")[1].split("```")[0].strip()
+        lines = raw.strip().splitlines()
+        result = {}
 
-        # Isole uniquement le bloc { ... }
-        start = raw.find("{")
-        end   = raw.rfind("}") + 1
-        if start != -1 and end > start:
-            raw = raw[start:end]
+        # Parse le format ligne par ligne
+        response_lines = []
+        in_response = False
 
-        # Supprime les caractères de contrôle invalides dans le JSON
-        raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', ' ', raw)
-        raw = raw.replace('\r', '')
+        for line in lines:
+            line = line.strip()
+            if line.startswith("SCORE:"):
+                try:
+                    result["urgency_score"] = int(re.search(r"\d+", line).group())
+                except:
+                    result["urgency_score"] = 5
+            elif line.startswith("CATEGORIE:"):
+                result["category"] = line.split(":", 1)[1].strip()
+            elif line.startswith("FORMULAIRE:"):
+                val = line.split(":", 1)[1].strip().lower()
+                result["needs_form"] = val in ("oui", "true", "yes")
+            elif line.startswith("TYPE:"):
+                val = line.split(":", 1)[1].strip().lower()
+                result["form_type"] = "" if val in ("aucun", "null", "none") else val
+            elif line.startswith("REPONSE:"):
+                in_response = True
+                response_lines.append(line.split(":", 1)[1].strip())
+            elif in_response:
+                response_lines.append(line)
 
-        data = json.loads(raw)
+        result["response"] = "\n".join(response_lines).strip()
 
-        # Valide les champs obligatoires
-        if "urgency_score" not in data or "response" not in data:
-            raise ValueError("JSON incomplet")
+        if not result.get("response"):
+            raise ValueError("Reponse email vide")
 
-        return data
+        return result
 
     def analyze(self, msg: EmailMessage) -> EmailMessage:
         print(f"\n🤖 Analyse : '{msg.subject}' (de {msg.sender})")
@@ -420,36 +431,36 @@ class AIEngine:
         context = clean_for_prompt(CONFIG['company_context'])
 
         prompt = (
-            f"Tu es l assistant email officiel de {company}.\n\n"
-            f"CONTEXTE DE L ENTREPRISE :\n{context}\n\n"
-            f"EMAIL RECU :\n"
-            f"De      : {sender} ({msg.sender_email})\n"
-            f"Sujet   : {subject}\n"
-            f"Contenu : {body}\n\n"
-            f"INSTRUCTIONS :\n"
-            f"Reponds UNIQUEMENT en JSON valide avec ce format exact :\n"
-            f"{{\n"
-            f'  "urgency_score": <entier 1-10>,\n'
-            f'  "category": "<Devis|RDV|SAV|Information|Spam|Autre>",\n'
-            f'  "needs_form": <true ou false>,\n'
-            f'  "form_type": "<devis|rdv|sav|info|null>",\n'
-            f'  "reasoning": "<explication en 1 phrase>",\n'
-            f'  "response": "<reponse email complete>"\n'
-            f"}}\n\n"
-            f"REGLE needs_form = true si email vague :\n"
-            f"- Devis sans details du service → form_type devis\n"
-            f"- RDV sans date ni objet → form_type rdv\n"
-            f"- SAV sans description → form_type sav\n"
-            f"- Question trop vague → form_type info\n\n"
-            f"STYLE DE REPONSE :\n"
-            f"- Francais uniquement\n"
-            f"- Vouvoiement OBLIGATOIRE\n"
-            f"- Commence par Bonjour [Prenom],\n"
-            f"- 3 paragraphes : accuse reception / action / invitation\n"
-            f"- Si needs_form true : mentionner le formulaire rapide (2 minutes)\n"
-            f"- Signature : Cordialement, L equipe {company}\n"
-            f"- JAMAIS d emoji dans la signature\n\n"
-            f"URGENCE : 8-10 urgent | 5-7 normal | 1-4 faible"
+            f"Tu es le gestionnaire email professionnel de {company}.\n"
+            f"Description de l entreprise : {context}\n\n"
+            f"=== EMAIL RECU ===\n"
+            f"Expediteur : {sender}\n"
+            f"Sujet : {subject}\n"
+            f"Message : {body}\n"
+            f"=================\n\n"
+            f"ETAPE 1 - Analyse :\n"
+            f"Lis attentivement le message. Identifie ce que le client veut vraiment.\n\n"
+            f"ETAPE 2 - Reponds avec exactement ce format, une valeur par ligne :\n\n"
+            f"SCORE: [chiffre de 1 a 10 selon urgence]\n"
+            f"CATEGORIE: [exactement un parmi : Devis, RDV, SAV, Information, Autre]\n"
+            f"FORMULAIRE: [oui si le message est trop vague pour repondre precisement, sinon non]\n"
+            f"TYPE: [si FORMULAIRE oui : devis ou rdv ou sav ou info. Sinon : aucun]\n"
+            f"REPONSE: [email complet professionnel en francais]\n\n"
+            f"=== REGLES STRICTES POUR LA REPONSE EMAIL ===\n"
+            f"- Commence TOUJOURS par : Bonjour {sender},\n"
+            f"- Vouvoiement OBLIGATOIRE (vous, votre, vos) — jamais tu\n"
+            f"- Ton professionnel et chaleureux\n"
+            f"- Paragraphe 1 : accuse reception du message en reformulant la demande\n"
+            f"- Paragraphe 2 : explique ce que tu vas faire\n"
+            f"  Si FORMULAIRE oui : ecris exactement cette phrase dans ce paragraphe :\n"
+            f"  Afin de vous preparer une reponse precise et personnalisee, nous vous invitons a completer notre formulaire rapide.\n"
+            f"  Si FORMULAIRE non : reponds directement et completement a la demande\n"
+            f"- Paragraphe 3 : invitation a agir ou question de suivi si necessaire\n"
+            f"- Termine TOUJOURS par :\n"
+            f"  Cordialement,\n"
+            f"  L equipe {company}\n"
+            f"- INTERDIT : emojis, abreviations, fautes d orthographe, melanger vous et tu\n"
+            f"- INTERDIT : inventer des informations que le client n a pas fournies"
         )
 
         result = None
