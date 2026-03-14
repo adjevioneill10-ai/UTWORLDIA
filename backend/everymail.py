@@ -27,8 +27,6 @@ load_dotenv("../config/.env")
 
 CONFIG = {
     "groq_api_key":     os.getenv("GROQ_API_KEY"),
-    "sendgrid_api_key": os.getenv("SENDGRID_API_KEY"),
-
     "gmail": {
         "email":     os.getenv("GMAIL_EMAIL"),
         "password":  os.getenv("GMAIL_APP_PASSWORD"),
@@ -272,43 +270,46 @@ class EmailConnector:
 
     def send(self, to: str, subject: str, body: str) -> bool:
         subj = f"Re: {subject}" if not subject.lower().startswith("re:") else subject
-        try:
-            sendgrid_key = CONFIG.get("sendgrid_api_key")
-            if sendgrid_key:
-                from sendgrid import SendGridAPIClient
-                from sendgrid.helpers.mail import Mail
-                message = Mail(
-                    from_email=self.cfg["email"],
-                    to_emails=to,
-                    subject=subj,
-                    plain_text_content=body,
-                )
-                sg = SendGridAPIClient(sendgrid_key)
-                response = sg.send(message)
-                if response.status_code in (200, 202):
-                    print(f"   ✅ Email envoyé via SendGrid à {to}")
-                    return True
-                else:
-                    print(f"   ❌ SendGrid status : {response.status_code}")
-                    return False
-            else:
-                import smtplib
+        import smtplib
+
+        brevo_host = os.getenv("BREVO_SMTP_HOST", "smtp-relay.brevo.com")
+        brevo_user = os.getenv("BREVO_SMTP_USER")
+        brevo_pass = os.getenv("BREVO_SMTP_PASS")
+
+        if brevo_user and brevo_pass:
+            # ── Brevo SMTP ─────────────────────────────────
+            try:
                 msg = MIMEMultipart()
                 msg["From"]    = self.cfg["email"]
                 msg["To"]      = to
                 msg["Subject"] = subj
                 msg.attach(MIMEText(body, "plain", "utf-8"))
-                with smtplib.SMTP(self.cfg["smtp_host"], self.cfg["smtp_port"]) as s:
+                with smtplib.SMTP(brevo_host, 587) as s:
                     s.ehlo()
                     s.starttls()
-                    s.ehlo()
+                    s.login(brevo_user, brevo_pass)
+                    s.send_message(msg)
+                print(f"   ✅ Email envoyé via Brevo à {to}")
+                return True
+            except Exception as e:
+                print(f"   ❌ Erreur Brevo : {e}")
+                return False
+        else:
+            # ── Gmail SMTP fallback ────────────────────────
+            try:
+                msg = MIMEMultipart()
+                msg["From"]    = self.cfg["email"]
+                msg["To"]      = to
+                msg["Subject"] = subj
+                msg.attach(MIMEText(body, "plain", "utf-8"))
+                with smtplib.SMTP_SSL(self.cfg["smtp_host"], 465) as s:
                     s.login(self.cfg["email"], self.cfg["password"])
                     s.send_message(msg)
                 print(f"   ✅ Email envoyé via Gmail à {to}")
                 return True
-        except Exception as e:
-            print(f"   ❌ Erreur envoi : {e}")
-            return False
+            except Exception as e:
+                print(f"   ❌ Erreur Gmail : {e}")
+                return False
 
     def create_draft(self, to: str, subject: str, body: str) -> bool:
         try:
