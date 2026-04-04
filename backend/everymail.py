@@ -428,12 +428,7 @@ def process(mail: Mail):
             result["needs_form"] = False
 
     # Envoie ou brouillon selon le score
-    auto_send = (
-        result["score"] >= THRESHOLD or
-        result["needs_form"] or
-        result["category"] in ("RDV", "Devis", "SAV")
-    )
-    if auto_send:
+    if result["score"] >= THRESHOLD or result["needs_form"]:
         if send_email(mail.from_email, mail.subject, body):
             _stats["forms" if result["needs_form"] else "sent"] += 1
         else:
